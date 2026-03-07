@@ -16,7 +16,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3030;
-
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🔒 Secure Multimedia Steganography Server running on port ${PORT}`);
+  console.log(`📁 Upload directory: ${uploadDir}`);
+  console.log(`🌐 Health check: /api/health`);
+  console.log(`📸 Images | 🎵 Audio | 🎬 Video steganography enabled`);
+});
 
 
 app.use(cors());
