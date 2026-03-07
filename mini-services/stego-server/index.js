@@ -15,7 +15,11 @@ import { encodeVideoMessage, decodeVideoMessage, isSupportedVideo, calculateVide
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const app = express();
-const PORT = 3030;
+const PORT = process.env.PORT || 3030;
+
+app.listen(PORT, () => {
+  console.log("🔒 Secure Multimedia Steganography Server running on port " + PORT);
+});
 
 app.use(cors());
 app.use(express.json());
