@@ -35,10 +35,21 @@ const fileTypes = {
   video: {
     icon: '🎬',
     label: 'Video',
-    extension: '.mp4',
-    contentType: 'video/mp4'
+    extension: '.avi',
+    contentType: 'video/x-msvideo'
   }
 };
+
+function getFilenameFromContentDisposition(headerValue) {
+  if (!headerValue) return null;
+  const utf8Match = headerValue.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) return decodeURIComponent(utf8Match[1]);
+
+  const asciiMatch = headerValue.match(/filename="([^"]+)"/i) || headerValue.match(/filename=([^;]+)/i);
+  if (asciiMatch?.[1]) return asciiMatch[1].trim();
+
+  return null;
+}
 
 // Detect file type from File object
 function getFileType(file) {
@@ -193,6 +204,8 @@ async function encode(e) {
     if (response.ok) {
       const blob = await response.blob();
       const blobUrl = URL.createObjectURL(blob);
+      const contentDisposition = response.headers.get('content-disposition');
+      const serverFilename = getFilenameFromContentDisposition(contentDisposition);
       
       // Get file type from the uploaded file
       const fileInput = document.getElementById('encodeFile');
@@ -231,7 +244,7 @@ async function encode(e) {
       document.getElementById('downloadStego').onclick = () => {
         const a = document.createElement('a');
         a.href = blobUrl;
-        a.download = `stego_${Date.now()}${config.extension}`;
+        a.download = serverFilename || `stego_${Date.now()}${config.extension}`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);

@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import cors from 'cors';
 import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { join, extname } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { execSync } from 'child_process';
@@ -67,12 +67,21 @@ function isWavFile(mimetype, filename) {
          filename.toLowerCase().endsWith('.wav');
 }
 
+function isSvgFile(mimetype, filename) {
+  const lowerName = (filename || '').toLowerCase();
+  return mimetype === 'image/svg+xml' || lowerName.endsWith('.svg');
+}
+
 // Accept ALL image, audio, and video files - NO size limits
 const upload = multer({
   storage: multer.memoryStorage(),
   fileFilter: (req, file, cb) => {
     // Accept ALL image types
     if (file.mimetype.startsWith('image/')) {
+      if (isSvgFile(file.mimetype, file.originalname)) {
+        cb(new Error('SVG is not supported for steganography. Please use a raster image like PNG, JPEG, WebP, BMP, TIFF, or GIF.'));
+        return;
+      }
       console.log(`[Upload] Accepting image: ${file.mimetype}, filename: ${file.originalname}`);
       cb(null, true);
       return;
@@ -99,6 +108,10 @@ const upload = multer({
     const videoExts = ['mp4', 'avi', 'mov', 'mkv', 'webm', 'wmv', 'flv', 'm4v', '3gp', 'ts', 'mts', 'm2ts', 'asf', 'rm', 'rmvb', 'vob', 'ogv'];
     
     if (imageExts.includes(ext)) {
+      if (ext === 'svg') {
+        cb(new Error('SVG is not supported for steganography. Please use a raster image like PNG, JPEG, WebP, BMP, TIFF, or GIF.'));
+        return;
+      }
       console.log(`[Upload] Accepting image by extension: .${ext}`);
       cb(null, true);
       return;
@@ -150,6 +163,27 @@ function getOutputExtension(fileType) {
   return extensions[fileType] || '.bin';
 }
 
+function getVideoOutputExtension(filename) {
+  const ext = (extname(filename || '') || '').toLowerCase();
+  const allowed = new Set(['.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v']);
+  return allowed.has(ext) ? ext : '.avi';
+}
+
+// Preserve original upload extension for temp input files.
+function getInputExtension(filename, fileType) {
+  const ext = (extname(filename || '') || '').toLowerCase();
+  if (ext && /^[.][a-z0-9]+$/.test(ext) && ext.length <= 10) {
+    return ext;
+  }
+
+  const defaults = {
+    image: '.png',
+    audio: '.wav',
+    video: '.mp4'
+  };
+  return defaults[fileType] || '.bin';
+}
+
 // Get content type based on file type
 function getContentType(fileType) {
   const types = {
@@ -158,6 +192,18 @@ function getContentType(fileType) {
     video: 'video/x-msvideo'
   };
   return types[fileType] || 'application/octet-stream';
+}
+
+function getVideoContentType(extension) {
+  const map = {
+    '.mp4': 'video/mp4',
+    '.m4v': 'video/mp4',
+    '.mov': 'video/quicktime',
+    '.avi': 'video/x-msvideo',
+    '.mkv': 'video/x-matroska',
+    '.webm': 'video/webm'
+  };
+  return map[extension] || 'video/x-msvideo';
 }
 
 app.post('/api/encode', upload.single('file'), async (req, res) => {
@@ -171,13 +217,22 @@ app.post('/api/encode', upload.single('file'), async (req, res) => {
     if (!file) return res.status(400).json({ success: false, error: 'No file uploaded' });
     if (!message || !message.trim()) return res.status(400).json({ success: false, error: 'No message' });
     if (!password || !password.trim()) return res.status(400).json({ success: false, error: 'No password' });
+    if (isSvgFile(file.mimetype, file.originalname)) {
+      return res.status(400).json({
+        success: false,
+        error: 'SVG is not supported for steganography. Please use a raster image like PNG, JPEG, WebP, BMP, TIFF, or GIF.'
+      });
+    }
 
     fileType = getFileType(file.mimetype, file.originalname);
     console.log(`[Encode] File type: ${fileType}, mimetype: ${file.mimetype}, filename: ${file.originalname}`);
 
-    const extension = getOutputExtension(fileType);
-    inputPath = join(uploadDir, `input_${timestamp}${extension}`);
-    outputPath = join(uploadDir, `stego_${timestamp}${extension}`);
+    const inputExtension = getInputExtension(file.originalname, fileType);
+    const outputExtension = fileType === 'video'
+      ? getVideoOutputExtension(file.originalname)
+      : getOutputExtension(fileType);
+    inputPath = join(uploadDir, `input_${timestamp}${inputExtension}`);
+    outputPath = join(uploadDir, `stego_${timestamp}${outputExtension}`);
 
     writeFileSync(inputPath, file.buffer);
 
@@ -242,8 +297,8 @@ app.post('/api/encode', upload.single('file'), async (req, res) => {
     }
 
     // Send response
-    res.setHeader('Content-Type', getContentType(fileType));
-    res.setHeader('Content-Disposition', `attachment; filename="stego_${timestamp}${extension}"`);
+    res.setHeader('Content-Type', fileType === 'video' ? getVideoContentType(outputExtension) : getContentType(fileType));
+    res.setHeader('Content-Disposition', `attachment; filename="stego_${timestamp}${outputExtension}"`);
     res.send(stegoBuffer);
 
     console.log(`[Encode] Successfully encoded ${fileType} file`);
@@ -262,19 +317,27 @@ app.post('/api/encode', upload.single('file'), async (req, res) => {
 app.post('/api/decode', upload.single('file'), async (req, res) => {
   const timestamp = Date.now();
   let inputPath, fileType, convertedPath = null;
+  let uploadedFilename = '';
 
   try {
     const { password } = req.body;
     const file = req.file;
+    uploadedFilename = file?.originalname || '';
 
     if (!file) return res.status(400).json({ success: false, error: 'No file uploaded' });
     if (!password || !password.trim()) return res.status(400).json({ success: false, error: 'No password' });
+    if (isSvgFile(file.mimetype, file.originalname)) {
+      return res.status(400).json({
+        success: false,
+        error: 'SVG is not supported for steganography. Please use a raster image like PNG, JPEG, WebP, BMP, TIFF, or GIF.'
+      });
+    }
 
     fileType = getFileType(file.mimetype, file.originalname);
     console.log(`[Decode] File type: ${fileType}, mimetype: ${file.mimetype}, filename: ${file.originalname}`);
 
-    const extension = getOutputExtension(fileType);
-    inputPath = join(uploadDir, `decode_${timestamp}${extension}`);
+    const inputExtension = getInputExtension(file.originalname, fileType);
+    inputPath = join(uploadDir, `decode_${timestamp}${inputExtension}`);
 
     writeFileSync(inputPath, file.buffer);
 
@@ -329,7 +392,15 @@ app.post('/api/decode', upload.single('file'), async (req, res) => {
       if (existsSync(inputPath)) unlinkSync(inputPath);
       if (convertedPath && existsSync(convertedPath)) unlinkSync(convertedPath);
     } catch (e) {}
-    res.status(500).json({ success: false, error: error.message || 'Decoding failed' });
+    let errorMessage = error.message || 'Decoding failed';
+    if (
+      fileType === 'video' &&
+      /\.(mp4|m4v|mov)$/i.test(uploadedFilename) &&
+      /delimiter not found|No hidden message found/i.test(errorMessage)
+    ) {
+      errorMessage += ' Hint: upload the exact stego AVI file downloaded from Encode. MP4/MOV re-encoding destroys LSB data.';
+    }
+    res.status(500).json({ success: false, error: errorMessage });
   }
 });
 
@@ -338,7 +409,7 @@ app.get('/api/health', (req, res) => {
     status: 'ok', 
     message: 'Secure Multimedia Steganography System running',
     supportedFormats: {
-      images: ['ALL image formats supported - JPG, PNG, WebP, BMP, GIF, TIFF, SVG, AVIF, HEIC, PSD, RAW, etc.'],
+      images: ['Raster image formats supported - JPG, PNG, WebP, BMP, GIF, TIFF, AVIF, HEIC, etc. (SVG not supported)'],
       audio: ['ALL audio formats supported - MP3, WAV, AAC, M4A, OGG, FLAC, WMA, OPUS, AIFF, etc. (auto-converted to WAV)'],
       video: ['ALL video formats supported - MP4, AVI, MOV, MKV, WebM, WMV, FLV, M4V, 3GP, TS, etc.'],
       note: 'No file size limits'
@@ -346,10 +417,19 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  console.error('[Upload] Middleware error:', err.message || err);
+  return res.status(400).json({
+    success: false,
+    error: err.message || 'Invalid upload'
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`🔒 Secure Multimedia Steganography Server running on port ${PORT}`);
   console.log(`📁 Upload directory: ${uploadDir}`);
   console.log(`🌐 Health check: http://localhost:${PORT}/api/health`);
-  console.log(`📸 Images: ALL formats | 🎵 Audio: ALL formats (auto-convert to WAV) | 🎬 Video: ALL formats`);
+  console.log(`📸 Images: Raster formats only (no SVG) | 🎵 Audio: ALL formats (auto-convert to WAV) | 🎬 Video: ALL formats`);
   console.log(`📏 File size: UNLIMITED`);
 });
