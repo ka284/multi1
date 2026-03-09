@@ -1,6 +1,6 @@
 import sharp from 'sharp';
 import { execSync } from 'child_process';
-import { unlinkSync, existsSync, mkdirSync, readdirSync } from 'fs';
+import { unlinkSync, existsSync, mkdirSync, readdirSync, rmSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -10,6 +10,8 @@ const __dirname = dirname(__filename);
 const HEADER_DELIMITER = '|||';
 const MAX_HEADER_SIZE = 2000;
 const FRAME_SKIP = 1; // Process every Nth frame
+const PNG_COMPRESSION_LEVEL = 0; // Faster frame writes
+const PNG_EFFORT = 1; // Lower CPU usage for PNG encoding
 
 /**
  * String to binary conversion
@@ -45,10 +47,6 @@ async function extractFrames(inputPath, outputDir, extractAllFrames = false) {
       mkdirSync(outputDir, { recursive: true });
     }
 
-    // Clear any existing frames
-    const existingFrames = readdirSync(outputDir).filter(f => f.endsWith('.png'));
-    existingFrames.forEach(f => unlinkSync(join(outputDir, f)));
-
     // Extract frames with ffmpeg - use frame-based extraction to handle short videos
     console.log(`[Video Extract] Extracting frames from: ${inputPath}`);
     
@@ -64,14 +62,14 @@ async function extractFrames(inputPath, outputDir, extractAllFrames = false) {
     if (extractAllFrames) {
       // For decoding: Extract ALL frames to ensure we get the hidden data
       console.log(`[Video Extract] Decoding mode - extracting ALL frames`);
-      cmd = `ffmpeg -i "${inputPath}" -vf "scale=-2:-2" -vsync vfr "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
+      cmd = `ffmpeg -threads 0 -i "${inputPath}" -vf "scale=-2:-2" -vsync vfr -compression_level 1 "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
     } else if (duration < 1) {
       // For very short videos during encoding, extract a fixed number of frames
       console.log(`[Video Extract] Short video detected, extracting first 10 frames`);
-      cmd = `ffmpeg -i "${inputPath}" -vf "select=gt(n\\,0),scale=-2:-2" -vsync vfr -frames:v 10 "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
+      cmd = `ffmpeg -threads 0 -i "${inputPath}" -vf "select=gt(n\\,0),scale=-2:-2" -vsync vfr -frames:v 10 -compression_level 1 "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
     } else {
       // For normal videos during encoding, extract at 1 fps
-      cmd = `ffmpeg -i "${inputPath}" -vf "scale=-2:-2" "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
+      cmd = `ffmpeg -threads 0 -i "${inputPath}" -vf "scale=-2:-2" -compression_level 1 "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
     }
     
     try {
@@ -153,7 +151,7 @@ async function rebuildVideo(framesDir, originalVideo, outputPath) {
 
     // Use lossless FFV1 and keep RGB pixel format to avoid chroma subsampling
     // that can destroy LSB payload bits.
-    const cmd = `ffmpeg -framerate ${outputFPS} -i "${join(framesDir, 'frame_%06d.png')}" -c:v ffv1 -pix_fmt rgb24 -y "${outputPath}" 2>&1`;
+    const cmd = `ffmpeg -threads 0 -framerate ${outputFPS} -i "${join(framesDir, 'frame_%06d.png')}" -c:v ffv1 -pix_fmt rgb24 -level 1 -g 1 -slices 16 -slicecrc 0 -y "${outputPath}" 2>&1`;
     
     console.log(`[Video Rebuild] Running ffmpeg...`);
     execSync(cmd, { stdio: 'ignore' });
@@ -186,12 +184,10 @@ async function rebuildVideo(framesDir, originalVideo, outputPath) {
  * Calculate video capacity (in characters)
  */
 export async function calculateVideoCapacity(inputPath) {
-  const tempDir = join(__dirname, '../temp_video_capacity');
+  const tempDir = join(__dirname, `../temp_video_capacity_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
 
   try {
-    if (!existsSync(tempDir)) {
-      mkdirSync(tempDir, { recursive: true });
-    }
+    mkdirSync(tempDir, { recursive: true });
 
     // Get duration from video
     const durationCmd = `ffprobe -v error -show_entries format=duration -of csv=s=x:p=0 "${inputPath}" 2>&1`;
@@ -240,6 +236,10 @@ export async function calculateVideoCapacity(inputPath) {
   } catch (error) {
     console.error('Video capacity calculation error:', error);
     return 0;
+  } finally {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch (e) {}
   }
 }
 
@@ -256,10 +256,8 @@ export function isSupportedVideo(mimetype) {
  * Encode message into video frames using LSB
  */
 export async function encodeVideoMessage(inputPath, data, outputPath) {
-  const tempDir = join(__dirname, '../temp_video_encode');
-  if (!existsSync(tempDir)) {
-    mkdirSync(tempDir, { recursive: true });
-  }
+  const tempDir = join(__dirname, `../temp_video_encode_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  mkdirSync(tempDir, { recursive: true });
 
   try {
     if (!inputPath || !data || !outputPath) {
@@ -309,7 +307,7 @@ export async function encodeVideoMessage(inputPath, data, outputPath) {
         await sharp(pixels, {
           raw: { width, height, channels }
         })
-          .png()
+          .png({ compressionLevel: PNG_COMPRESSION_LEVEL, effort: PNG_EFFORT })
           .toFile(framePath);
       } catch (e) {
         console.error(`Error processing frame ${frames[i]}:`, e);
@@ -325,18 +323,15 @@ export async function encodeVideoMessage(inputPath, data, outputPath) {
     // Rebuild video with modified frames
     await rebuildVideo(tempDir, inputPath, outputPath);
 
-    // Cleanup temp frames
-    frames.forEach(f => {
-      try {
-        unlinkSync(join(tempDir, f));
-      } catch (e) {}
-    });
-
     console.log(`[Video Encode] Successfully encoded video to ${outputPath}`);
 
     return outputPath;
   } catch (error) {
     throw new Error(`Video encoding failed: ${error.message}`);
+  } finally {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch (e) {}
   }
 }
 
@@ -344,10 +339,8 @@ export async function encodeVideoMessage(inputPath, data, outputPath) {
  * Decode message from video frames
  */
 export async function decodeVideoMessage(inputPath) {
-  const tempDir = join(__dirname, '../temp_video_decode');
-  if (!existsSync(tempDir)) {
-    mkdirSync(tempDir, { recursive: true });
-  }
+  const tempDir = join(__dirname, `../temp_video_decode_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  mkdirSync(tempDir, { recursive: true });
 
   try {
     if (!inputPath) {
@@ -374,6 +367,8 @@ export async function decodeVideoMessage(inputPath) {
     let messageLength = NaN;
     let requiredTotalBits = null;
     const delimiterBinary = stringToBinary(HEADER_DELIMITER);
+    const delimiterLength = delimiterBinary.length;
+    let recentBits = '';
 
     // Process frames until we have enough bits for header + full message
     for (let i = 0; i < frames.length; i++) {
@@ -389,13 +384,18 @@ export async function decodeVideoMessage(inputPath) {
         const { data: pixels } = result;
 
         for (let j = 0; j < pixels.length; j++) {
-          extractedBits.push((pixels[j] & 1).toString());
+          const bit = (pixels[j] & 1).toString();
+          extractedBits.push(bit);
           
           // First locate header delimiter and parse message length
-          if (!foundDelimiter && extractedBits.length >= delimiterBinary.length) {
-            const recentBits = extractedBits.slice(-delimiterBinary.length).join('');
+          if (!foundDelimiter) {
+            recentBits += bit;
+            if (recentBits.length > delimiterLength) {
+              recentBits = recentBits.slice(-delimiterLength);
+            }
+
             if (recentBits === delimiterBinary) {
-              const candidateHeaderEnd = extractedBits.length - delimiterBinary.length;
+              const candidateHeaderEnd = extractedBits.length - delimiterLength;
               const candidateHeaderText = binaryToString(extractedBits.slice(0, candidateHeaderEnd).join(''));
               const match = candidateHeaderText.match(/MSG:(\d+)$/);
               const candidateLength = match ? parseInt(match[1], 10) : NaN;
@@ -426,55 +426,33 @@ export async function decodeVideoMessage(inputPath) {
     }
 
     if (headerEndIndex === -1 || !foundDelimiter) {
-      // Cleanup
-      frames.forEach(f => {
-        try {
-          unlinkSync(join(tempDir, f));
-        } catch (e) {}
-      });
       throw new Error('No hidden message found in video - delimiter not found');
     }
 
     if (isNaN(messageLength) || messageLength <= 0 || messageLength > 100000) {
-      // Cleanup
-      frames.forEach(f => {
-        try {
-          unlinkSync(join(tempDir, f));
-        } catch (e) {}
-      });
       throw new Error('Invalid message length');
     }
 
-    // Extract header and message
-    const binaryData = extractedBits.join('');
+    // Extract message bits only (avoid joining full extracted bitstream)
     const messageStartIndex = headerEndIndex + delimiterBinary.length;
     const messageEndIndex = messageStartIndex + (messageLength * 8);
 
-    if (messageEndIndex > binaryData.length) {
-      // Cleanup
-      frames.forEach(f => {
-        try {
-          unlinkSync(join(tempDir, f));
-        } catch (e) {}
-      });
-      throw new Error(`Video message incomplete (need ${messageEndIndex} bits, have ${binaryData.length})`);
+    if (messageEndIndex > extractedBits.length) {
+      throw new Error(`Video message incomplete (need ${messageEndIndex} bits, have ${extractedBits.length})`);
     }
 
-    const messageBinary = binaryData.substring(messageStartIndex, messageEndIndex);
+    const messageBinary = extractedBits.slice(messageStartIndex, messageEndIndex).join('');
     const message = binaryToString(messageBinary);
 
     console.log(`[Video Decode] Successfully extracted message (${message.length} chars)`);
-
-    // Cleanup temp frames
-    frames.forEach(f => {
-      try {
-        unlinkSync(join(tempDir, f));
-      } catch (e) {}
-    });
 
     return message;
   } 
   catch (error) {
     throw new Error(`Video decoding failed: ${error.message}`);
+  } finally {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch (e) {}
   }
 } 
