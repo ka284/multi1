@@ -155,7 +155,7 @@ function getContentType(fileType) {
   const types = {
     image: 'image/png',
     audio: 'audio/wav',
-    video: 'video/x-msvideo/mp4'
+    video: 'video/x-msvideo'
   };
   return types[fileType] || 'application/octet-stream';
 }

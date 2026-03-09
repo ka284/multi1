@@ -7,7 +7,7 @@
  */
 
 import { exec } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 import { resolve } from 'path';
 
 const inputPath = process.argv[2];
@@ -65,8 +65,7 @@ exec(cmd, (error, stdout, stderr) => {
   console.log(`\nYou can now upload this WAV file to the steganography system.`);
 
   // Get file size info
-  const fs = await import('fs');
-  const stats = fs.statSync(resolvedOutputPath);
+  const stats = statSync(resolvedOutputPath);
   const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
   console.log(`📊 File size: ${sizeMB} MB`);
 });
