@@ -10,6 +10,7 @@ const __dirname = dirname(__filename);
 const HEADER_DELIMITER = '|||';
 const MAX_HEADER_SIZE = 2000;
 const FRAME_SKIP = 1; // Process every Nth frame
+const SAMPLE_FPS = 1; // Sample 1 frame per second for faster processing
 const PNG_COMPRESSION_LEVEL = 0; // Faster frame writes
 const PNG_EFFORT = 1; // Lower CPU usage for PNG encoding
 
@@ -68,8 +69,8 @@ async function extractFrames(inputPath, outputDir, extractAllFrames = false) {
       console.log(`[Video Extract] Short video detected, extracting first 10 frames`);
       cmd = `ffmpeg -threads 0 -i "${inputPath}" -vf "select=gt(n\\,0),scale=-2:-2" -vsync vfr -frames:v 10 -compression_level 1 "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
     } else {
-      // For normal videos during encoding, extract at 1 fps
-      cmd = `ffmpeg -threads 0 -i "${inputPath}" -vf "scale=-2:-2" -compression_level 1 "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
+      // For normal videos during encoding/decoding, sample frames to reduce latency
+      cmd = `ffmpeg -threads 0 -i "${inputPath}" -vf "fps=${SAMPLE_FPS},scale=-2:-2" -vsync vfr -compression_level 1 "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
     }
     
     try {
@@ -127,8 +128,9 @@ async function rebuildVideo(framesDir, originalVideo, outputPath) {
 
     console.log(`[Video Rebuild] Dimensions: ${width}x${height}`);
 
-    // Try to get original video's frame rate
+    // Try to get original video's frame rate and duration
     let originalFPS = 30; // Default to 30 fps
+    let originalDuration = 0;
     try {
       const fpsCmd = `ffprobe -v error -select_streams v -of default=noprint_wrappers=1:nokey=1 -show_entries stream=r_frame_rate "${originalVideo}" 2>&1`;
       const fpsOutput = execSync(fpsCmd, { encoding: 'utf-8' }).trim();
@@ -143,9 +145,19 @@ async function rebuildVideo(framesDir, originalVideo, outputPath) {
       console.log(`[Video Rebuild] Could not detect FPS, using default: ${originalFPS}`);
     }
 
-    // Use original video's FPS for better compatibility
-    // Accept that frame alignment may differ from encoding
-    const outputFPS = originalFPS;
+    try {
+      const durationCmd = `ffprobe -v error -show_entries format=duration -of csv=s=x:p=0 "${originalVideo}" 2>&1`;
+      originalDuration = parseFloat(execSync(durationCmd, { encoding: 'utf-8' }).trim()) || 0;
+      console.log(`[Video Rebuild] Original duration: ${originalDuration}s`);
+    } catch (e) {
+      console.log('[Video Rebuild] Could not detect duration');
+    }
+
+    // If frames roughly match sampled extraction, rebuild at sample fps to preserve duration.
+    const expectedSampledFrames = originalDuration > 0 ? Math.max(1, Math.floor(originalDuration * SAMPLE_FPS)) : 0;
+    const sampledExtractionDetected = expectedSampledFrames > 0 &&
+      Math.abs(frameCount - expectedSampledFrames) <= Math.max(2, Math.ceil(expectedSampledFrames * 0.2));
+    const outputFPS = sampledExtractionDetected ? SAMPLE_FPS : originalFPS;
 
     console.log(`[Video Rebuild] Frame count: ${frameCount}, Output FPS: ${outputFPS}`);
 
@@ -213,8 +225,8 @@ export async function calculateVideoCapacity(inputPath) {
 
     console.log(`[Video Capacity] Resolution: ${width}x${height}, Channels: ${channels}`);
 
-    // Estimate total frames (1 frame per second = our extraction rate)
-    const totalFrames = Math.max(1, Math.floor(duration)); // At least 1 frame
+    // Estimate total frames based on sampled extraction rate
+    const totalFrames = Math.max(1, Math.floor(duration * SAMPLE_FPS)); // At least 1 frame
     const effectiveFrames = Math.max(1, Math.floor(totalFrames / FRAME_SKIP)); // At least 1 frame
 
     const pixelsPerFrame = width * height * channels;
@@ -267,7 +279,7 @@ export async function encodeVideoMessage(inputPath, data, outputPath) {
     console.log(`[Video Encode] Starting encode process...`);
 
     // Extract frames
-    const frames = await extractFrames(inputPath, tempDir,true);
+    const frames = await extractFrames(inputPath, tempDir, false);
 
     if (frames.length === 0) {
       throw new Error('No frames extracted from video');
@@ -349,9 +361,8 @@ export async function decodeVideoMessage(inputPath) {
 
     console.log(`[Video Decode] Starting decode process...`);
 
-    // Extract frames at 1 fps to EXACTLY MATCH the encoding extraction rate
-    // This ensures we get the SAME frames (same indices) that were used during encoding
-    const frames = await extractFrames(inputPath, tempDir, true);
+    // Extract frames at sampled rate to match encoding extraction strategy
+    const frames = await extractFrames(inputPath, tempDir, false);
 
     if (frames.length === 0) {
       throw new Error('No frames extracted from video - the stego video may be corrupted');
