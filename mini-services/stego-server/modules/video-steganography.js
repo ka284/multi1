@@ -1,11 +1,15 @@
 import sharp from 'sharp';
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { unlinkSync, existsSync, mkdirSync, readdirSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const HEADER_DELIMITER = '|||';
 const MAX_HEADER_SIZE = 2000;
-const FRAME_SKIP = 5; // Process every Nth frame
+const FRAME_SKIP = 1; // Process every Nth frame
 
 /**
  * String to binary conversion
@@ -67,7 +71,7 @@ async function extractFrames(inputPath, outputDir, extractAllFrames = false) {
       cmd = `ffmpeg -i "${inputPath}" -vf "select=gt(n\\,0),scale=-2:-2" -vsync vfr -frames:v 10 "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
     } else {
       // For normal videos during encoding, extract at 1 fps
-      cmd = `ffmpeg -i "${inputPath}" -vf "fps=1,scale=-2:-2" "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
+      cmd = `ffmpeg -i "${inputPath}" -vf "scale=-2:-2" "${join(outputDir, 'frame_%06d.png')}" -y 2>&1`;
     }
     
     try {
@@ -143,14 +147,13 @@ async function rebuildVideo(framesDir, originalVideo, outputPath) {
 
     // Use original video's FPS for better compatibility
     // Accept that frame alignment may differ from encoding
-    const outputFPS = Math.max(1, Math.min(originalFPS, 30));
+    const outputFPS = originalFPS;
 
     console.log(`[Video Rebuild] Frame count: ${frameCount}, Output FPS: ${outputFPS}`);
 
-    // Use Motion JPEG codec in AVI container for better LSB preservation
-    // MJPEG is frame-based compression, less destructive to individual pixel values
-    // AVI container works well with MJPEG
-    const cmd = `ffmpeg -framerate ${outputFPS} -i "${join(framesDir, 'frame_%06d.png')}" -c:v mjpeg -qscale 1 -vcodec mjpeg -y "${outputPath}" 2>&1`;
+    // Use lossless FFV1 and keep RGB pixel format to avoid chroma subsampling
+    // that can destroy LSB payload bits.
+    const cmd = `ffmpeg -framerate ${outputFPS} -i "${join(framesDir, 'frame_%06d.png')}" -c:v ffv1 -pix_fmt rgb24 -y "${outputPath}" 2>&1`;
     
     console.log(`[Video Rebuild] Running ffmpeg...`);
     execSync(cmd, { stdio: 'ignore' });
@@ -233,7 +236,7 @@ export async function calculateVideoCapacity(inputPath) {
       unlinkSync(firstFrame);
     } catch (e) {}
 
-    return Math.max(1, capacity); // Ensure capacity is at least 1 character
+    return Math.max(0, capacity);
   } catch (error) {
     console.error('Video capacity calculation error:', error);
     return 0;
@@ -246,7 +249,7 @@ export async function calculateVideoCapacity(inputPath) {
  */
 export function isSupportedVideo(mimetype) {
   // Accept all video types - ffmpeg will handle format conversion
-  return mimetype.startsWith('video/');
+  return typeof mimetype === 'string' && mimetype.startsWith('video/');
 }
 
 /**
@@ -254,6 +257,9 @@ export function isSupportedVideo(mimetype) {
  */
 export async function encodeVideoMessage(inputPath, data, outputPath) {
   const tempDir = join(__dirname, '../temp_video_encode');
+  if (!existsSync(tempDir)) {
+    mkdirSync(tempDir, { recursive: true });
+  }
 
   try {
     if (!inputPath || !data || !outputPath) {
@@ -263,7 +269,7 @@ export async function encodeVideoMessage(inputPath, data, outputPath) {
     console.log(`[Video Encode] Starting encode process...`);
 
     // Extract frames
-    const frames = await extractFrames(inputPath, tempDir);
+    const frames = await extractFrames(inputPath, tempDir,true);
 
     if (frames.length === 0) {
       throw new Error('No frames extracted from video');
@@ -272,14 +278,14 @@ export async function encodeVideoMessage(inputPath, data, outputPath) {
     console.log(`[Video Encode] Extracted ${frames.length} frames`);
 
     // Prepare data to embed
-    const headerText = `${data.length}${HEADER_DELIMITER}`;
+    const headerText = `MSG:${data.length}${HEADER_DELIMITER}`;
     const headerBinary = stringToBinary(headerText);
     const dataBinary = stringToBinary(data);
     const totalBinary = headerBinary + dataBinary;
     let binaryIndex = 0;
 
     // Encode data into selected frames
-    for (let i = 0; i < frames.length && binaryIndex < totalBinary.length; i += FRAME_SKIP) {
+    for (let i = 0; i < frames.length && binaryIndex < totalBinary.length; i++){
       const framePath = join(tempDir, frames[i]);
       
       try {
@@ -339,6 +345,9 @@ export async function encodeVideoMessage(inputPath, data, outputPath) {
  */
 export async function decodeVideoMessage(inputPath) {
   const tempDir = join(__dirname, '../temp_video_decode');
+  if (!existsSync(tempDir)) {
+    mkdirSync(tempDir, { recursive: true });
+  }
 
   try {
     if (!inputPath) {
@@ -349,7 +358,7 @@ export async function decodeVideoMessage(inputPath) {
 
     // Extract frames at 1 fps to EXACTLY MATCH the encoding extraction rate
     // This ensures we get the SAME frames (same indices) that were used during encoding
-    const frames = await extractFrames(inputPath, tempDir, false);
+    const frames = await extractFrames(inputPath, tempDir, true);
 
     if (frames.length === 0) {
       throw new Error('No frames extracted from video - the stego video may be corrupted');
@@ -362,10 +371,12 @@ export async function decodeVideoMessage(inputPath) {
     const extractedBits = [];
     let foundDelimiter = false;
     let headerEndIndex = -1;
+    let messageLength = NaN;
+    let requiredTotalBits = null;
     const delimiterBinary = stringToBinary(HEADER_DELIMITER);
 
-    // Process ALL frames to find the hidden message (more robust against compression artifacts)
-    for (let i = 0; i < frames.length && !foundDelimiter; i++) {
+    // Process frames until we have enough bits for header + full message
+    for (let i = 0; i < frames.length; i++) {
       const framePath = join(tempDir, frames[i]);
       
       try {
@@ -380,23 +391,41 @@ export async function decodeVideoMessage(inputPath) {
         for (let j = 0; j < pixels.length; j++) {
           extractedBits.push((pixels[j] & 1).toString());
           
-          // Check if we have the delimiter
-          if (extractedBits.length >= delimiterBinary.length && !foundDelimiter) {
+          // First locate header delimiter and parse message length
+          if (!foundDelimiter && extractedBits.length >= delimiterBinary.length) {
             const recentBits = extractedBits.slice(-delimiterBinary.length).join('');
             if (recentBits === delimiterBinary) {
-              headerEndIndex = extractedBits.length - delimiterBinary.length;
-              foundDelimiter = true;
-              console.log(`[Video Decode] Found delimiter at bit ${headerEndIndex}`);
-              break;
+              const candidateHeaderEnd = extractedBits.length - delimiterBinary.length;
+              const candidateHeaderText = binaryToString(extractedBits.slice(0, candidateHeaderEnd).join(''));
+              const match = candidateHeaderText.match(/MSG:(\d+)$/);
+              const candidateLength = match ? parseInt(match[1], 10) : NaN;
+
+              if (!isNaN(candidateLength) && candidateLength > 0 && candidateLength <= 100000) {
+                headerEndIndex = candidateHeaderEnd;
+                messageLength = candidateLength;
+                requiredTotalBits = headerEndIndex + delimiterBinary.length + (messageLength * 8);
+                foundDelimiter = true;
+                console.log(`[Video Decode] Found delimiter at bit ${headerEndIndex}`);
+                console.log(`[Video Decode] Message length from header: ${messageLength}`);
+              }
             }
           }
+
+          // Stop once we have all bits for the message payload
+          if (requiredTotalBits !== null && extractedBits.length >= requiredTotalBits) {
+            break;
+          }
+        }
+
+        if (requiredTotalBits !== null && extractedBits.length >= requiredTotalBits) {
+          break;
         }
       } catch (e) {
         console.error(`Error processing frame ${frames[i]}:`, e);
       }
     }
 
-    if (headerEndIndex === -1) {
+    if (headerEndIndex === -1 || !foundDelimiter) {
       // Cleanup
       frames.forEach(f => {
         try {
@@ -405,13 +434,6 @@ export async function decodeVideoMessage(inputPath) {
       });
       throw new Error('No hidden message found in video - delimiter not found');
     }
-
-    // Extract header and message
-    const binaryData = extractedBits.join('');
-    const headerBinary = binaryData.substring(0, headerEndIndex);
-    const messageLength = parseInt(binaryToString(headerBinary), 10);
-
-    console.log(`[Video Decode] Message length from header: ${messageLength}`);
 
     if (isNaN(messageLength) || messageLength <= 0 || messageLength > 100000) {
       // Cleanup
@@ -423,7 +445,8 @@ export async function decodeVideoMessage(inputPath) {
       throw new Error('Invalid message length');
     }
 
-    // Extract message
+    // Extract header and message
+    const binaryData = extractedBits.join('');
     const messageStartIndex = headerEndIndex + delimiterBinary.length;
     const messageEndIndex = messageStartIndex + (messageLength * 8);
 
